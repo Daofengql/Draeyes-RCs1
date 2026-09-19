@@ -8,6 +8,7 @@
 #include "config.h"
 #include "eye_animation.h"
 #include "remote_protocol.h"
+#include "status_led.h"
 
 namespace {
 
@@ -15,26 +16,40 @@ enum class ControlMode : uint8_t {
   MANUAL_MODE,
   AUTO_FULL_MODE,
   AUTO_BLINK_MODE,
-  AUTO_BLINK_LOCKED_MODE,
 };
 
 ControlMode currentMode = ControlMode::MANUAL_MODE;
 bool joystickLocked = false;
+uint8_t lockedJoystickX = 127;
+uint8_t lockedJoystickY = 127;
+bool eyelidControlLinked = false;
 
 int joystickXRead = 127;
 int joystickYRead = 127;
-uint8_t joystickXCenter = 127;
-uint8_t joystickYCenter = 127;
+uint16_t joystickXRawCenter = config::ADC_MAX_READING / 2;
+uint16_t joystickYRawCenter = config::ADC_MAX_READING / 2;
+uint16_t joystickXRawMin = 0;
+uint16_t joystickXRawMax = config::ADC_MAX_READING;
+uint16_t joystickYRawMin = 0;
+uint16_t joystickYRawMax = config::ADC_MAX_READING;
+uint16_t joystickXRawSample = 0;
+uint16_t joystickYRawSample = 0;
+uint16_t joystickXRawFiltered = 0;
+uint16_t joystickYRawFiltered = 0;
+uint32_t joystickXMillivolts = 0;
+uint32_t joystickYMillivolts = 0;
+bool joystickFilterInitialized = false;
 
 bool lastR1 = false;
-bool lastR2 = false;
-bool lastLeftBlink = false;
-bool lastRightBlink = false;
+bool lastJoystickButton = false;
+bool lastLeftButton = false;
+bool lastRightButton = false;
+bool lastLeftEyelidPressed = false;
+bool lastRightEyelidPressed = false;
+bool lastLinkedEyelidPressed = false;
 
 uint32_t lastPressTimeR1 = 0;
-uint32_t lastPressTimeR2 = 0;
 uint8_t pressCountR1 = 0;
-uint8_t pressCountR2 = 0;
 
 uint32_t r1LongPressStartedAt = 0;
 uint32_t r2LongPressStartedAt = 0;
@@ -49,27 +64,50 @@ bool r1LongPressHandled = false;
 bool r2LongPressHandled = false;
 bool pairingHandled = false;
 bool calibrationHandled = false;
-volatile bool pairingTransportStatusPending = false;
+bool joystickCalibrationSavePending = false;
+uint32_t joystickCalibrationLastChangeAt = 0;
+uint32_t joystickCalibrationLastSaveAt = 0;
 
 float leftBlinkValues[8] = {};
 float rightBlinkValues[8] = {};
+float linkedBlinkValues[8] = {};
 uint8_t leftBlinkCount = 0;
 uint8_t rightBlinkCount = 0;
+uint8_t linkedBlinkCount = 0;
 uint8_t leftBlinkIndex = 0;
 uint8_t rightBlinkIndex = 0;
+uint8_t linkedBlinkIndex = 0;
 bool leftBlinkActive = false;
 bool rightBlinkActive = false;
+bool linkedBlinkActive = false;
 float currentLeftBlink = 1.0f;
 float currentRightBlink = 1.0f;
 
 eye_animation::EyeState eyeState = {};
 uint32_t lastSendAt = 0;
 uint32_t lastDiagnosticsAt = 0;
-bool espNowReady = false;
-bool eepromReady = false;
+uint32_t lastJoystickRawDiagnosticsAt = 0;
+uint32_t lastBatteryMeasureAt = 0;
+uint16_t batteryAdcMillivolts = 0;
+float batteryVoltage = 0.0f;
+  bool espNowReady = false;
+  bool eepromReady = false;
+
+  uint8_t activeWifiChannel = config::ESPNOW_DISCOVERY_CHANNEL;
+uint8_t pairingRequestedChannel = 0;
+uint32_t pairingNonce = 0;
 
 bool isPressed(uint8_t pin) {
   return digitalRead(pin) == LOW;
+}
+
+bool isDataChannel(uint8_t channel) {
+  for (uint8_t index = 0; index < config::ESPNOW_DATA_CHANNEL_COUNT; ++index) {
+    if (config::ESPNOW_DATA_CHANNELS[index] == channel) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint16_t readAxisAverage(uint8_t pin) {
@@ -85,25 +123,136 @@ uint16_t readAxisAverage(uint8_t pin) {
   return static_cast<uint16_t>(total / config::JOYSTICK_SAMPLE_COUNT);
 }
 
-void readJoystickData() {
-  const uint16_t xRaw = readAxisAverage(config::JOYSTICK_X_ADC_PIN);
-  const uint16_t yRaw = readAxisAverage(config::JOYSTICK_Y_ADC_PIN);
+uint16_t readMilliVoltsAverage(uint8_t pin, uint8_t count) {
+  uint32_t total = 0;
+  for (uint8_t sample = 0; sample < count; ++sample) {
+    total += analogReadMilliVolts(pin);
+  }
+  return static_cast<uint16_t>(total / count);
+}
 
-  joystickXRead = constrain(
-      map(xRaw, 0, config::ADC_MAX_READING, 255, 0), 0, 255);
-  joystickYRead = constrain(
-      map(yRaw, 0, config::ADC_MAX_READING, 255, 0), 0, 255);
+void updateBatteryMeasurement(uint32_t now, bool force = false) {
+  if (!force && now - lastBatteryMeasureAt <
+                   config::BATTERY_MEASURE_INTERVAL_MS) {
+    return;
+  }
+
+  lastBatteryMeasureAt = now;
+  batteryAdcMillivolts = readMilliVoltsAverage(
+      config::BATTERY_ADC_PIN, config::BATTERY_SAMPLE_COUNT);
+  const float dividerRatio =
+      (config::BATTERY_DIVIDER_HIGH_OHMS +
+       config::BATTERY_DIVIDER_LOW_OHMS) /
+      config::BATTERY_DIVIDER_LOW_OHMS;
+  batteryVoltage =
+      (static_cast<float>(batteryAdcMillivolts) / 1000.0f) * dividerRatio;
+}
+
+uint16_t filterAxisReading(uint16_t sample, uint16_t &filtered) {
+  if (!joystickFilterInitialized) {
+    filtered = sample;
+    return filtered;
+  }
+
+  const int32_t delta = static_cast<int32_t>(sample) - filtered;
+  if (delta >= -static_cast<int32_t>(config::JOYSTICK_FILTER_DEADBAND) &&
+      delta <= static_cast<int32_t>(config::JOYSTICK_FILTER_DEADBAND)) {
+    return filtered;
+  }
+
+  int32_t step = delta / config::JOYSTICK_FILTER_DIVISOR;
+  if (step == 0) {
+    step = delta > 0 ? 1 : -1;
+  }
+  filtered = static_cast<uint16_t>(constrain(
+      static_cast<int32_t>(filtered) + step, 0,
+      static_cast<int32_t>(config::ADC_MAX_READING)));
+  return filtered;
+}
+
+uint8_t mapRawAxis(uint16_t raw,
+                   uint16_t rawMin,
+                   uint16_t rawCenter,
+                   uint16_t rawMax) {
+  rawMin = constrain(rawMin, 0, config::ADC_MAX_READING);
+  rawCenter = constrain(rawCenter, 1, config::ADC_MAX_READING - 1);
+  rawMax = constrain(rawMax, 1, config::ADC_MAX_READING);
+
+  // Endpoints are learned progressively. A side is usable only after it has
+  // moved far enough from the center; otherwise synthesize that side so small
+  // center noise cannot be amplified into a large output change.
+  const bool minSideUsable =
+      rawMin < rawCenter &&
+      rawCenter - rawMin >= config::JOYSTICK_RANGE_CALIBRATION_MIN_SPAN;
+  if (!minSideUsable) {
+    rawMin = rawCenter > config::JOYSTICK_RANGE_CALIBRATION_MIN_SPAN
+                 ? rawCenter - config::JOYSTICK_RANGE_CALIBRATION_MIN_SPAN
+                 : 0;
+  }
+
+  const bool maxSideUsable =
+      rawMax > rawCenter &&
+      rawMax - rawCenter >= config::JOYSTICK_RANGE_CALIBRATION_MIN_SPAN;
+  if (!maxSideUsable) {
+    const uint32_t fallbackMax =
+        static_cast<uint32_t>(rawCenter) +
+        config::JOYSTICK_RANGE_CALIBRATION_MIN_SPAN;
+    rawMax = fallbackMax < config::ADC_MAX_READING
+                 ? static_cast<uint16_t>(fallbackMax)
+                 : config::ADC_MAX_READING;
+  }
+
+  if (raw <= rawCenter) {
+    return static_cast<uint8_t>(constrain(
+        map(raw, rawMin, rawCenter, 255, 127), 127, 255));
+  }
+  return static_cast<uint8_t>(constrain(
+      map(raw, rawCenter, rawMax, 127, 0), 0, 127));
+}
+
+void readJoystickData() {
+  joystickXRawSample = readAxisAverage(config::JOYSTICK_X_ADC_PIN);
+  joystickYRawSample = readAxisAverage(config::JOYSTICK_Y_ADC_PIN);
+  joystickXMillivolts = analogReadMilliVolts(config::JOYSTICK_X_ADC_PIN);
+  joystickYMillivolts = analogReadMilliVolts(config::JOYSTICK_Y_ADC_PIN);
+
+  joystickXRawFiltered = filterAxisReading(
+      joystickXRawSample, joystickXRawFiltered);
+  joystickYRawFiltered = filterAxisReading(
+      joystickYRawSample, joystickYRawFiltered);
+  joystickFilterInitialized = true;
+
+  joystickXRead = mapRawAxis(joystickXRawFiltered,
+                             joystickXRawMin,
+                             joystickXRawCenter,
+                             joystickXRawMax);
+  joystickYRead = mapRawAxis(joystickYRawFiltered,
+                             joystickYRawMin,
+                             joystickYRawCenter,
+                             joystickYRawMax);
 }
 
 int mapCentered(int value, int center, bool reversed) {
   center = constrain(center, 1, 254);
   value = constrain(value, 0, 255);
 
+  if (abs(value - center) <= config::JOYSTICK_OUTPUT_DEADBAND) {
+    value = center;
+  }
+
   int mapped = value < center
                    ? map(value, 0, center, 0, 127)
                    : map(value, center, 255, 127, 255);
   mapped = constrain(mapped, 0, 255);
   return reversed ? 255 - mapped : mapped;
+}
+
+int getLogicalJoystickXRead() {
+  return config::JOYSTICK_SWAP_XY ? joystickYRead : joystickXRead;
+}
+
+int getLogicalJoystickYRead() {
+  return config::JOYSTICK_SWAP_XY ? joystickXRead : joystickYRead;
 }
 
 void generateBlinkArray(float start, float stop, uint8_t count, float *buffer) {
@@ -145,17 +294,56 @@ void startRightBlink(bool pressed) {
   rightBlinkActive = true;
 }
 
-void advanceManualBlinkEffects(bool leftPressed, bool rightPressed) {
-  if (currentMode != ControlMode::MANUAL_MODE) {
+void startLinkedBlink(bool pressed) {
+  const uint8_t count = pressed ? random(6, 8) : random(7, 9);
+  generateBlinkArray(pressed ? 1.0f : 0.0f,
+                     pressed ? 0.0f : 1.0f,
+                     count,
+                     linkedBlinkValues);
+  linkedBlinkCount = count;
+  linkedBlinkIndex = 0;
+  linkedBlinkActive = true;
+}
+
+void advanceManualBlinkEffects(bool leftPressed,
+                               bool rightPressed,
+                               bool joystickButtonPressed) {
+  if (currentMode != ControlMode::MANUAL_MODE || joystickButtonPressed) {
+    lastLeftEyelidPressed = false;
+    lastRightEyelidPressed = false;
+    lastLinkedEyelidPressed = false;
     return;
   }
 
-  if (leftPressed != lastLeftBlink) {
+  if (eyelidControlLinked) {
+    if (leftPressed != lastLinkedEyelidPressed) {
+      startLinkedBlink(leftPressed);
+    }
+    lastLinkedEyelidPressed = leftPressed;
+    lastLeftEyelidPressed = false;
+    lastRightEyelidPressed = false;
+
+    if (linkedBlinkActive) {
+      if (linkedBlinkIndex < linkedBlinkCount) {
+        const float value = linkedBlinkValues[linkedBlinkIndex++];
+        currentLeftBlink = value;
+        currentRightBlink = value;
+      } else {
+        linkedBlinkActive = false;
+      }
+    }
+    return;
+  }
+
+  if (leftPressed != lastLeftEyelidPressed) {
     startLeftBlink(leftPressed);
   }
-  if (rightPressed != lastRightBlink) {
+  if (rightPressed != lastRightEyelidPressed) {
     startRightBlink(rightPressed);
   }
+  lastLeftEyelidPressed = leftPressed;
+  lastRightEyelidPressed = rightPressed;
+  lastLinkedEyelidPressed = false;
 
   if (leftBlinkActive) {
     if (leftBlinkIndex < leftBlinkCount) {
@@ -192,8 +380,6 @@ const char *modeName(ControlMode mode) {
       return "全自动";
     case ControlMode::AUTO_BLINK_MODE:
       return "自动眨眼";
-    case ControlMode::AUTO_BLINK_LOCKED_MODE:
-      return "锁定+眨眼";
   }
   return "未知";
 }
@@ -207,56 +393,250 @@ void cycleMode() {
       currentMode = ControlMode::AUTO_BLINK_MODE;
       break;
     case ControlMode::AUTO_BLINK_MODE:
-      currentMode = ControlMode::AUTO_BLINK_LOCKED_MODE;
-      break;
-    case ControlMode::AUTO_BLINK_LOCKED_MODE:
       currentMode = ControlMode::MANUAL_MODE;
       break;
   }
 
   Serial.print("模式: ");
   Serial.println(modeName(currentMode));
+
+  switch (currentMode) {
+    case ControlMode::MANUAL_MODE:
+      status_led::notify(status_led::Event::MODE_MANUAL);
+      break;
+    case ControlMode::AUTO_FULL_MODE:
+      status_led::notify(status_led::Event::MODE_AUTO_FULL);
+      break;
+    case ControlMode::AUTO_BLINK_MODE:
+      status_led::notify(status_led::Event::MODE_AUTO_BLINK);
+      break;
+  }
+}
+
+void saveJoystickCalibration() {
+  if (!eepromReady) {
+    return;
+  }
+
+  EEPROM.put(config::EEPROM_X_CENTER_ADDRESS, joystickXRawCenter);
+  EEPROM.put(config::EEPROM_X_MIN_ADDRESS, joystickXRawMin);
+  EEPROM.put(config::EEPROM_X_MAX_ADDRESS, joystickXRawMax);
+  EEPROM.put(config::EEPROM_Y_CENTER_ADDRESS, joystickYRawCenter);
+  EEPROM.put(config::EEPROM_Y_MIN_ADDRESS, joystickYRawMin);
+  EEPROM.put(config::EEPROM_Y_MAX_ADDRESS, joystickYRawMax);
+  EEPROM.write(config::EEPROM_MAGIC_ADDRESS, config::EEPROM_MAGIC);
+  EEPROM.commit();
+  joystickCalibrationSavePending = false;
+  joystickCalibrationLastSaveAt = millis();
+}
+
+bool validJoystickCenter(uint16_t rawCenter) {
+  return rawCenter > 0 && rawCenter < config::ADC_MAX_READING;
+}
+
+void requestJoystickCalibrationSave(uint32_t now) {
+  joystickCalibrationSavePending = true;
+  joystickCalibrationLastChangeAt = now;
+}
+
+void serviceJoystickCalibrationPersistence(uint32_t now) {
+  if (!joystickCalibrationSavePending) {
+    return;
+  }
+
+  const bool quiet = now - joystickCalibrationLastChangeAt >=
+                     config::JOYSTICK_CALIBRATION_SAVE_DELAY_MS;
+  const bool overdue = now - joystickCalibrationLastSaveAt >=
+                       config::JOYSTICK_CALIBRATION_SAVE_MAX_INTERVAL_MS;
+  if (!quiet && !overdue) {
+    return;
+  }
+
+  saveJoystickCalibration();
+  Serial.printf("[joystick] bounds saved X=%u/%u/%u Y=%u/%u/%u\n",
+                joystickXRawMin,
+                joystickXRawCenter,
+                joystickXRawMax,
+                joystickYRawMin,
+                joystickYRawCenter,
+                joystickYRawMax);
+}
+
+void updateJoystickCalibrationBounds(uint32_t now) {
+  bool changed = false;
+
+  // Use filtered readings so small ADC noise cannot expand the stored range.
+  // Bounds only expand; normal control is never paused for calibration.
+  if (joystickXRawFiltered < joystickXRawMin) {
+    joystickXRawMin = joystickXRawFiltered;
+    changed = true;
+  }
+  if (joystickXRawFiltered > joystickXRawMax) {
+    joystickXRawMax = joystickXRawFiltered;
+    changed = true;
+  }
+  if (joystickYRawFiltered < joystickYRawMin) {
+    joystickYRawMin = joystickYRawFiltered;
+    changed = true;
+  }
+  if (joystickYRawFiltered > joystickYRawMax) {
+    joystickYRawMax = joystickYRawFiltered;
+    changed = true;
+  }
+
+  if (changed) {
+    requestJoystickCalibrationSave(now);
+  }
+  serviceJoystickCalibrationPersistence(now);
 }
 
 void calibrateJoystick() {
-  Serial.println("joy_zero_testing...");
-  readJoystickData();
-  delay(300);
+  // The four-button gesture only establishes the center. Endpoint learning
+  // continues in the ordinary loop, so calibration never enters a capture
+  // state or interrupts control traffic.
+  joystickXRawCenter = constrain(joystickXRawFiltered, 1,
+                                 config::ADC_MAX_READING - 1);
+  joystickYRawCenter = constrain(joystickYRawFiltered, 1,
+                                 config::ADC_MAX_READING - 1);
 
-  joystickXCenter = static_cast<uint8_t>(constrain(joystickXRead, 1, 254));
-  joystickYCenter = static_cast<uint8_t>(constrain(joystickYRead, 1, 254));
-
-  if (eepromReady) {
-    Serial.println("Writing in EEPROM...");
-    EEPROM.write(config::EEPROM_X_CENTER_ADDRESS, joystickXCenter);
-    EEPROM.write(config::EEPROM_Y_CENTER_ADDRESS, joystickYCenter);
-    EEPROM.commit();
+  // Keep learned endpoints when they still surround the new center. If an
+  // axis has no usable range yet, start that axis at the center and let normal
+  // movement expand it.
+  if (joystickXRawMin >= joystickXRawCenter ||
+      joystickXRawMax <= joystickXRawCenter) {
+    joystickXRawMin = joystickXRawCenter;
+    joystickXRawMax = joystickXRawCenter;
+  }
+  if (joystickYRawMin >= joystickYRawCenter ||
+      joystickYRawMax <= joystickYRawCenter) {
+    joystickYRawMin = joystickYRawCenter;
+    joystickYRawMax = joystickYRawCenter;
   }
 
-  Serial.println("Done...");
-  Serial.print(" X center: ");
-  Serial.println(joystickXCenter);
-  Serial.print(" Y center: ");
-  Serial.println(joystickYCenter);
+  saveJoystickCalibration();
+  status_led::notify(status_led::Event::CALIBRATED);
+  Serial.printf("[joystick] center saved X=%u Y=%u; endpoints learn during normal use\n",
+                joystickXRawCenter,
+                joystickYRawCenter);
 }
 
 void initializeCalibration() {
   eepromReady = EEPROM.begin(config::EEPROM_SIZE);
   if (!eepromReady) {
-    Serial.println("EEPROM initialization failed; using default joystick centers");
+    readJoystickData();
+    joystickXRawCenter = constrain(joystickXRawFiltered, 1,
+                                   config::ADC_MAX_READING - 1);
+    joystickYRawCenter = constrain(joystickYRawFiltered, 1,
+                                   config::ADC_MAX_READING - 1);
+    joystickXRawMin = joystickXRawCenter;
+    joystickXRawMax = joystickXRawCenter;
+    joystickYRawMin = joystickYRawCenter;
+    joystickYRawMax = joystickYRawCenter;
+    Serial.println("EEPROM initialization failed; using runtime joystick calibration");
     return;
   }
 
-  if (EEPROM.read(config::EEPROM_MAGIC_ADDRESS) != config::EEPROM_MAGIC) {
-    calibrateJoystick();
-    EEPROM.write(config::EEPROM_MAGIC_ADDRESS, config::EEPROM_MAGIC);
-    EEPROM.commit();
+  const bool hasStoredCalibration =
+      EEPROM.read(config::EEPROM_MAGIC_ADDRESS) == config::EEPROM_MAGIC;
+  if (hasStoredCalibration) {
+    EEPROM.get(config::EEPROM_X_CENTER_ADDRESS, joystickXRawCenter);
+    EEPROM.get(config::EEPROM_X_MIN_ADDRESS, joystickXRawMin);
+    EEPROM.get(config::EEPROM_X_MAX_ADDRESS, joystickXRawMax);
+    EEPROM.get(config::EEPROM_Y_CENTER_ADDRESS, joystickYRawCenter);
+    EEPROM.get(config::EEPROM_Y_MIN_ADDRESS, joystickYRawMin);
+    EEPROM.get(config::EEPROM_Y_MAX_ADDRESS, joystickYRawMax);
   }
 
-  joystickXCenter = static_cast<uint8_t>(constrain(
-      EEPROM.read(config::EEPROM_X_CENTER_ADDRESS), 1, 254));
-  joystickYCenter = static_cast<uint8_t>(constrain(
-      EEPROM.read(config::EEPROM_Y_CENTER_ADDRESS), 1, 254));
+  const bool storedCentersValid =
+      hasStoredCalibration && validJoystickCenter(joystickXRawCenter) &&
+      validJoystickCenter(joystickYRawCenter);
+  if (!storedCentersValid) {
+    readJoystickData();
+    joystickXRawCenter = constrain(joystickXRawFiltered, 1,
+                                   config::ADC_MAX_READING - 1);
+    joystickYRawCenter = constrain(joystickYRawFiltered, 1,
+                                   config::ADC_MAX_READING - 1);
+    joystickXRawMin = joystickXRawCenter;
+    joystickXRawMax = joystickXRawCenter;
+    joystickYRawMin = joystickYRawCenter;
+    joystickYRawMax = joystickYRawCenter;
+    saveJoystickCalibration();
+    Serial.println("[joystick] initialized; center saved, endpoints learn during use");
+  } else {
+    // The previous firmware used 0..4095 as a fallback range. Convert that
+    // legacy default to runtime-learned bounds so it can be refined naturally.
+    if (joystickXRawMin == 0 && joystickXRawMax == config::ADC_MAX_READING) {
+      joystickXRawMin = joystickXRawCenter;
+      joystickXRawMax = joystickXRawCenter;
+      requestJoystickCalibrationSave(millis());
+    }
+    if (joystickYRawMin == 0 && joystickYRawMax == config::ADC_MAX_READING) {
+      joystickYRawMin = joystickYRawCenter;
+      joystickYRawMax = joystickYRawCenter;
+      requestJoystickCalibrationSave(millis());
+    }
+    if (joystickXRawMin > joystickXRawCenter) {
+      joystickXRawMin = joystickXRawCenter;
+    }
+    if (joystickXRawMax < joystickXRawCenter) {
+      joystickXRawMax = joystickXRawCenter;
+    }
+    if (joystickYRawMin > joystickYRawCenter) {
+      joystickYRawMin = joystickYRawCenter;
+    }
+    if (joystickYRawMax < joystickYRawCenter) {
+      joystickYRawMax = joystickYRawCenter;
+    }
+  }
+
+  Serial.printf("[joystick] loaded X=%u/%u/%u Y=%u/%u/%u\n",
+                joystickXRawMin,
+                joystickXRawCenter,
+                joystickXRawMax,
+                joystickYRawMin,
+                joystickYRawCenter,
+                joystickYRawMax);
+
+  eyelidControlLinked =
+      EEPROM.read(config::EEPROM_EYELID_LINKED_ADDRESS) ==
+      config::EYELID_CONTROL_LINKED;
+}
+
+void saveEyelidControlMode() {
+  if (!eepromReady) {
+    return;
+  }
+  EEPROM.write(config::EEPROM_EYELID_LINKED_ADDRESS,
+               eyelidControlLinked ? config::EYELID_CONTROL_LINKED
+                                    : config::EYELID_CONTROL_INDEPENDENT);
+  EEPROM.commit();
+}
+
+bool updateBroadcastPeer(uint8_t channel) {
+  if (esp_now_is_peer_exist(config::RECEIVER_MAC)) {
+    esp_now_del_peer(config::RECEIVER_MAC);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, config::RECEIVER_MAC, sizeof(config::RECEIVER_MAC));
+  peerInfo.channel = channel;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+  return esp_now_add_peer(&peerInfo) == ESP_OK;
+}
+
+bool switchRadioChannel(uint8_t channel) {
+  if (channel != config::ESPNOW_DISCOVERY_CHANNEL && !isDataChannel(channel)) {
+    return false;
+  }
+  if (esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+    return false;
+  }
+  if (espNowReady && !updateBroadcastPeer(channel)) {
+    return false;
+  }
+  activeWifiChannel = channel;
+  return true;
 }
 
 template <size_t Capacity>
@@ -273,46 +653,16 @@ bool sendDocument(StaticJsonDocument<Capacity> &document,
     return false;
   }
 
-  // Match the original STA1 packet exactly: JSON bytes without a trailing NUL.
+  // Send JSON bytes without a trailing NUL.
   const size_t payloadLength = jsonLength;
-  if (loggedRequest != nullptr) {
-    Serial.printf(
-        "[ESP-NOW] sending req=%s target=%02X:%02X:%02X:%02X:%02X:%02X "
-        "channel=%u bytes=%u payload=%s\n",
-        loggedRequest,
-        config::RECEIVER_MAC[0],
-        config::RECEIVER_MAC[1],
-        config::RECEIVER_MAC[2],
-        config::RECEIVER_MAC[3],
-        config::RECEIVER_MAC[4],
-        config::RECEIVER_MAC[5],
-        config::ESPNOW_WIFI_CHANNEL,
-        static_cast<unsigned int>(payloadLength),
-        jsonBuffer);
-  }
-
-  const bool isPairingRequest =
-      loggedRequest != nullptr &&
-      strcmp(loggedRequest, remote_protocol::REQUEST_PAIRING) == 0;
-  if (isPairingRequest) {
-    pairingTransportStatusPending = true;
-  }
 
   const esp_err_t result = esp_now_send(
       config::RECEIVER_MAC,
       reinterpret_cast<const uint8_t *>(jsonBuffer),
       payloadLength);
   if (result != ESP_OK) {
-    if (isPairingRequest) {
-      pairingTransportStatusPending = false;
-    }
-    Serial.printf("[ESP-NOW] queue failed: error=%d req=%s\n",
-                  result,
-                  loggedRequest != nullptr ? loggedRequest : "controller");
+    (void)loggedRequest;
     return false;
-  }
-  if (loggedRequest != nullptr) {
-    Serial.printf("[ESP-NOW] queued req=%s\n", loggedRequest);
   }
   return true;
 }
@@ -323,7 +673,8 @@ bool sendRequest(const char *request) {
   if (strcmp(request, remote_protocol::REQUEST_PAIRING) == 0) {
     document["type"] = remote_protocol::DEVICE_TYPE;
     document["name"] = remote_protocol::DEVICE_NAME;
-    document["caps"] = remote_protocol::DEVICE_CAPABILITIES;
+    document["channel"] = pairingRequestedChannel;
+    document["nonce"] = pairingNonce;
   }
   return sendDocument(document, request);
 }
@@ -334,12 +685,14 @@ uint8_t getJoystickXToSend() {
         map(static_cast<int>(eyeState.eyeCurrentX), 60, 180, 0, 255), 0, 255));
   }
 
-  if (currentMode == ControlMode::AUTO_BLINK_LOCKED_MODE || joystickLocked) {
-    return 127;
+  if (joystickLocked) {
+    return lockedJoystickX;
   }
 
   return static_cast<uint8_t>(mapCentered(
-      joystickXRead, joystickXCenter, config::JOYSTICK_X_REVERSED));
+      getLogicalJoystickXRead(), 127,
+      config::JOYSTICK_SWAP_XY ? config::JOYSTICK_Y_REVERSED
+                               : config::JOYSTICK_X_REVERSED));
 }
 
 uint8_t getJoystickYToSend() {
@@ -348,12 +701,14 @@ uint8_t getJoystickYToSend() {
         map(static_cast<int>(eyeState.eyeCurrentY), 60, 180, 0, 255), 0, 255));
   }
 
-  if (currentMode == ControlMode::AUTO_BLINK_LOCKED_MODE || joystickLocked) {
-    return 127;
+  if (joystickLocked) {
+    return lockedJoystickY;
   }
 
   return static_cast<uint8_t>(mapCentered(
-      joystickYRead, joystickYCenter, config::JOYSTICK_Y_REVERSED));
+      getLogicalJoystickYRead(), 127,
+      config::JOYSTICK_SWAP_XY ? config::JOYSTICK_X_REVERSED
+                               : config::JOYSTICK_Y_REVERSED));
 }
 
 bool sendController() {
@@ -376,7 +731,26 @@ bool sendController() {
   return sendDocument(document);
 }
 
+void beginPairingSession() {
+  // Pairing and control stay on the fixed channel 1. The receiver records the
+  // sender MAC; there is no approval response or follow-up handshake.
+  pairingRequestedChannel = config::ESPNOW_WIFI_CHANNEL;
+  pairingNonce = esp_random();
+  if (pairingNonce == 0) {
+    pairingNonce = 1;
+  }
+
+  if (!switchRadioChannel(config::ESPNOW_WIFI_CHANNEL)) {
+    Serial.println("Pairing failed: unable to switch to channel 1");
+    return;
+  }
+
+  // Send the initial packet; the button gesture repeats this session while held.
+  sendRequest(remote_protocol::REQUEST_PAIRING);
+}
+
 void processButtonGestures(uint32_t now,
+                           bool joystickButtonPressed,
                            bool r1Pressed,
                            bool r2Pressed,
                            bool leftPressed,
@@ -405,31 +779,35 @@ void processButtonGestures(uint32_t now,
       pairingStartedAt = now;
       lastPairingSendAt = 0;
       pairingHandled = false;
-      Serial.printf("[pairing] R1+R2 detected; hold for %lu ms\n",
-                    static_cast<unsigned long>(config::LONG_PRESS_MS));
     } else if (now - pairingStartedAt >= config::LONG_PRESS_MS) {
       if (!pairingHandled) {
         pairingHandled = true;
-        Serial.printf("[pairing] hold complete; retrying every %lu ms while held\n",
-                      static_cast<unsigned long>(config::PAIRING_RETRY_INTERVAL_MS));
+        beginPairingSession();
+        lastPairingSendAt = now;
+      } else if (now - lastPairingSendAt >=
+                 config::PAIRING_RETRY_INTERVAL_MS) {
+        lastPairingSendAt = now;
+        sendRequest(remote_protocol::REQUEST_PAIRING);
       }
 
-      if (lastPairingSendAt == 0 ||
-          now - lastPairingSendAt >= config::PAIRING_RETRY_INTERVAL_MS) {
-        lastPairingSendAt = now;
-        const bool queued = sendRequest(remote_protocol::REQUEST_PAIRING);
-        Serial.println(queued ? "[pairing] request queued"
-                              : "[pairing] request was not queued");
-      }
     }
   } else {
-    if (pairingTracking && !pairingHandled) {
-      Serial.printf("[pairing] cancelled after %lu ms\n",
-                    static_cast<unsigned long>(now - pairingStartedAt));
+    if (pairingTracking) {
+      pairingTracking = false;
+      pairingHandled = false;
     }
-    pairingTracking = false;
-    pairingHandled = false;
     lastPairingSendAt = 0;
+  }
+
+  if (!allFourPressed && !pairingPressed && joystickButtonPressed) {
+    if (leftPressed && !lastLeftButton) {
+      sendRequest(remote_protocol::REQUEST_COMBO_PREVIOUS);
+      status_led::notify(status_led::Event::PREVIOUS_EYE);
+    }
+    if (rightPressed && !lastRightButton) {
+      sendRequest(remote_protocol::REQUEST_COMBO_NEXT);
+      status_led::notify(status_led::Event::NEXT_EYE);
+    }
   }
 
   if (!allFourPressed && !pairingPressed && r1Pressed && !r2Pressed) {
@@ -439,7 +817,18 @@ void processButtonGestures(uint32_t now,
       r1LongPressHandled = false;
     } else if (!r1LongPressHandled &&
                now - r1LongPressStartedAt >= config::LONG_PRESS_MS) {
-      Serial.println("R1 long press: light sensor control is unavailable on Mini");
+      if (currentMode == ControlMode::MANUAL_MODE ||
+          currentMode == ControlMode::AUTO_BLINK_MODE) {
+        if (joystickLocked) {
+          joystickLocked = false;
+          status_led::notify(status_led::Event::UNLOCKED);
+        } else {
+          lockedJoystickX = getJoystickXToSend();
+          lockedJoystickY = getJoystickYToSend();
+          joystickLocked = true;
+          status_led::notify(status_led::Event::LOCKED);
+        }
+      }
       r1LongPressHandled = true;
     }
   } else {
@@ -454,12 +843,15 @@ void processButtonGestures(uint32_t now,
       r2LongPressHandled = false;
     } else if (!r2LongPressHandled &&
                now - r2LongPressStartedAt >= config::LONG_PRESS_MS) {
-      if (currentMode == ControlMode::MANUAL_MODE ||
-          currentMode == ControlMode::AUTO_BLINK_MODE) {
-        joystickLocked = !joystickLocked;
-        Serial.println(joystickLocked ? "R2 long press: joystick locked"
-                                      : "R2 long press: joystick unlocked");
+      eyelidControlLinked = !eyelidControlLinked;
+      if (eyelidControlLinked) {
+        currentRightBlink = currentLeftBlink;
+        status_led::notify(status_led::Event::LINKED_ON);
+      } else {
+        currentLeftBlink = currentRightBlink;
+        status_led::notify(status_led::Event::LINKED_OFF);
       }
+      saveEyelidControlMode();
       r2LongPressHandled = true;
     }
   } else {
@@ -480,49 +872,24 @@ void processButtonGestures(uint32_t now,
       pressCountR1 = 0;
     }
   }
-
-  if (r2Pressed && !lastR2 && !r1Pressed) {
-    if (now - lastPressTimeR2 <= config::MULTI_PRESS_WINDOW_MS) {
-      ++pressCountR2;
-    } else {
-      pressCountR2 = 1;
-    }
-    lastPressTimeR2 = now;
-
-    if (pressCountR2 >= 3) {
-      sendRequest(remote_protocol::REQUEST_CHANGE);
-      pressCountR2 = 0;
-    }
-  }
 }
 
-void commitButtonStates(bool r1Pressed,
-                        bool r2Pressed,
+void commitButtonStates(bool joystickButtonPressed,
+                        bool r1Pressed,
                         bool leftPressed,
                         bool rightPressed) {
+  lastJoystickButton = joystickButtonPressed;
   lastR1 = r1Pressed;
-  lastR2 = r2Pressed;
-  lastLeftBlink = leftPressed;
-  lastRightBlink = rightPressed;
-}
-
-void onEspNowSent(const uint8_t *, esp_now_send_status_t status) {
-  if (pairingTransportStatusPending) {
-    pairingTransportStatusPending = false;
-    Serial.printf("[pairing] ESP-NOW transport=%s (receiver approval is separate)\n",
-                  status == ESP_NOW_SEND_SUCCESS ? "success" : "failed");
-    return;
-  }
-  if (status != ESP_NOW_SEND_SUCCESS) {
-    Serial.println("ESP-NOW send failed");
-  }
+  lastLeftButton = leftPressed;
+  lastRightButton = rightPressed;
 }
 
 bool initializeEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  if (esp_wifi_set_channel(config::ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+  const uint8_t initialChannel = config::ESPNOW_WIFI_CHANNEL;
+  if (esp_wifi_set_channel(initialChannel, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
     Serial.println("Wi-Fi channel setup failed");
     return false;
   }
@@ -532,17 +899,8 @@ bool initializeEspNow() {
     return false;
   }
 
-  if (esp_now_register_send_cb(onEspNowSent) != ESP_OK) {
-    Serial.println("ESP-NOW callback setup failed");
-    return false;
-  }
-
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, config::RECEIVER_MAC, sizeof(config::RECEIVER_MAC));
-  peerInfo.channel = config::ESPNOW_WIFI_CHANNEL;
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+  activeWifiChannel = initialChannel;
+  if (!updateBroadcastPeer(initialChannel)) {
     Serial.println("Adding ESP-NOW receiver failed");
     return false;
   }
@@ -552,8 +910,13 @@ bool initializeEspNow() {
 
 void initializeInputs() {
   analogReadResolution(config::ADC_RESOLUTION_BITS);
+  analogSetPinAttenuation(config::JOYSTICK_X_ADC_PIN,
+                          config::JOYSTICK_ADC_ATTENUATION);
+  analogSetPinAttenuation(config::JOYSTICK_Y_ADC_PIN,
+                          config::JOYSTICK_ADC_ATTENUATION);
+  analogSetPinAttenuation(config::BATTERY_ADC_PIN,
+                          config::BATTERY_ADC_ATTENUATION);
 
-  // Kept ready for a future joystick-button action; currently ignored.
   pinMode(config::JOYSTICK_BUTTON_PIN, INPUT_PULLUP);
   pinMode(config::LEFT_BLINK_BUTTON_PIN, INPUT_PULLUP);
   pinMode(config::RIGHT_BLINK_BUTTON_PIN, INPUT_PULLUP);
@@ -574,29 +937,63 @@ void printDiagnostics(uint32_t now,
 
   lastDiagnosticsAt = now;
   Serial.printf(
-      "[status] mode=%s espnow=%s joy=%d,%d send=%u,%u center=%u,%u "
-      "buttons=J%d LB%d RB%d R1%d R2%d eyelid=%.2f,%.2f\n",
+      "[status] mode=%s espnow=%s channel=%u joy=%d,%d raw=%u,%u "
+      "batt=%.2fV/%umV rangeX=%u/%u/%u rangeY=%u/%u/%u send=%u,%u "
+      "buttons=J%d LB%d RB%d R1%d R2%d linked=%d locked=%d eyelid=%.2f,%.2f\n",
       modeName(currentMode),
       espNowReady ? "ready" : "error",
+      activeWifiChannel,
       joystickXRead,
       joystickYRead,
+      joystickXRawSample,
+      joystickYRawSample,
+      static_cast<double>(batteryVoltage),
+      batteryAdcMillivolts,
+      joystickXRawMin,
+      joystickXRawCenter,
+      joystickXRawMax,
+      joystickYRawMin,
+      joystickYRawCenter,
+      joystickYRawMax,
       getJoystickXToSend(),
       getJoystickYToSend(),
-      joystickXCenter,
-      joystickYCenter,
       joystickButtonPressed,
       leftButtonPressed,
       rightButtonPressed,
       r1Pressed,
       r2Pressed,
+      eyelidControlLinked,
+      joystickLocked,
       currentLeftBlink,
       currentRightBlink);
+}
+
+void printJoystickRawDiagnostics(uint32_t now) {
+  if (!config::ENABLE_JOYSTICK_RAW_DIAGNOSTICS ||
+      now - lastJoystickRawDiagnosticsAt <
+          config::JOYSTICK_RAW_DIAGNOSTICS_INTERVAL_MS ||
+      Serial.availableForWrite() < 96) {
+    return;
+  }
+
+  lastJoystickRawDiagnosticsAt = now;
+  Serial.printf("J raw=%u,%u mv=%lu,%lu filt=%u,%u norm=%d,%d out=%u,%u\n",
+                joystickXRawSample,
+                joystickYRawSample,
+                static_cast<unsigned long>(joystickXMillivolts),
+                static_cast<unsigned long>(joystickYMillivolts),
+                joystickXRawFiltered,
+                joystickYRawFiltered,
+                joystickXRead,
+                joystickYRead,
+                getJoystickXToSend(),
+                getJoystickYToSend());
 }
 
 }  // namespace
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(config::SERIAL_BAUD_RATE);
   const uint32_t serialWaitStartedAt = millis();
   while (!Serial && millis() - serialWaitStartedAt < 1500) {
     delay(10);
@@ -606,16 +1003,22 @@ void setup() {
   Serial.println("Draeye RC Mini starting");
 
   initializeInputs();
+  updateBatteryMeasurement(millis(), true);
   initializeCalibration();
-  randomSeed(static_cast<uint32_t>(analogRead(config::JOYSTICK_X_ADC_PIN)));
+  randomSeed(static_cast<uint32_t>(analogRead(config::JOYSTICK_X_ADC_PIN)) ^ esp_random());
   eye_animation::init(&eyeState);
+  status_led::init();
+  status_led::notify(status_led::Event::STARTUP);
 
-  espNowReady = initializeEspNow();
+  espNowReady = config::JOYSTICK_DIAGNOSTIC_ONLY ? false : initializeEspNow();
+  if (config::JOYSTICK_DIAGNOSTIC_ONLY) {
+    Serial.println("ADC diagnostic-only mode: ESP-NOW disabled");
+  }
   if (!espNowReady) {
     Serial.println("ESP-NOW is not ready; input processing remains enabled");
   } else {
     Serial.printf("ESP-NOW ready: channel=%u mac=%s\n",
-                  config::ESPNOW_WIFI_CHANNEL,
+                  activeWifiChannel,
                   WiFi.macAddress().c_str());
   }
 }
@@ -623,6 +1026,8 @@ void setup() {
 void loop() {
   readJoystickData();
   const uint32_t now = millis();
+  updateBatteryMeasurement(now);
+  updateJoystickCalibrationBounds(now);
   const bool joystickButtonPressed = isPressed(config::JOYSTICK_BUTTON_PIN);
   const bool r1Pressed = isPressed(config::R1_BUTTON_PIN);
   const bool r2Pressed = isPressed(config::R2_BUTTON_PIN);
@@ -631,20 +1036,36 @@ void loop() {
   const bool leftPressed = leftButtonPressed;
   const bool rightPressed = rightButtonPressed;
 
-  processButtonGestures(now, r1Pressed, r2Pressed, leftPressed, rightPressed);
-  advanceManualBlinkEffects(leftPressed, rightPressed);
+  processButtonGestures(now,
+                        joystickButtonPressed,
+                        r1Pressed,
+                        r2Pressed,
+                        leftPressed,
+                        rightPressed);
+  advanceManualBlinkEffects(leftPressed, rightPressed, joystickButtonPressed);
   updateAnimation();
-  commitButtonStates(r1Pressed, r2Pressed, leftPressed, rightPressed);
+  commitButtonStates(joystickButtonPressed,
+                     r1Pressed,
+                     leftPressed,
+                     rightPressed);
   printDiagnostics(now,
                    joystickButtonPressed,
                    leftButtonPressed,
                    rightButtonPressed,
                    r1Pressed,
                    r2Pressed);
+  printJoystickRawDiagnostics(now);
+  status_led::PairingState pairingState =
+      status_led::PairingState::INACTIVE;
+  if (pairingTracking) {
+    pairingState = now - pairingStartedAt >= config::LONG_PRESS_MS
+                       ? status_led::PairingState::ACTIVE
+                       : status_led::PairingState::PENDING;
+  }
+  status_led::update(now, batteryVoltage, pairingState, espNowReady);
 
-  // Do not interleave control traffic with pairing retries. This makes the
-  // pairing callback unambiguous and avoids flooding the broadcast channel.
-  if (!pairingTracking && now - lastSendAt >= config::ESPNOW_SEND_INTERVAL_MS) {
+  if (!config::JOYSTICK_DIAGNOSTIC_ONLY &&
+      now - lastSendAt >= config::ESPNOW_SEND_INTERVAL_MS) {
     lastSendAt = now;
     sendController();
   }
