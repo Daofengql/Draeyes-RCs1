@@ -1,14 +1,14 @@
 # ESP-NOW Control Network Design
 
-Status: current implementation baseline for Mini, C3, and S3 firmware.
+Status: current implementation baseline for RCs1, C3, and S3 firmware.
 
 ## Product Model
 
-`Draeye RC Mini` is the baseline remote for all new remotes. It provides one
-joystick and independent left and right eyelid control. The ESP32-C3 Mini has
+`Draeyes RCs1` is the baseline remote for all new remotes. It provides one
+joystick and independent left and right eyelid control. The RCs1 has
 no display or status LED.
 
-One Mini can control multiple bound devices through a broadcast control stream.
+One RCs1 can control multiple bound devices through a broadcast control stream.
 S3 is currently a controlled receiver only; ESP-NOW Host and downstream-device
 control are outside the current implementation.
 
@@ -28,13 +28,13 @@ model.
   binding. It does not require a secret key exchange.
 
 ```text
-Mini  --->  C3 / S3 receiver
+RCs1  --->  C3 / S3 receiver
        all on Wi-Fi channel 1
 ```
 
 ## Coordinate Contract
 
-Mini is the only side that calibrates the joystick. It stores each axis' raw
+RCs1 is the only side that calibrates the joystick. It stores each axis' raw
 center and physical minimum/maximum, then sends calibrated X/Y values as
 integers from `0` to `255`, where `127` is neutral. C3 and S3 map them
 linearly to their screen offsets and do not capture another center.
@@ -44,7 +44,7 @@ with coordinates from `-1.0` to `1.0`.
 
 ## Binding State
 
-Mini always starts and operates on channel 1. For `SAVE`, S3 persists the
+RCs1 always starts and operates on channel 1. For `SAVE`, S3 persists the
 remote MAC and restores it on the next boot. For `ONCE`, a remote MAC exists
 only while ESP-NOW is running. C3 controlled devices use runtime-only bindings.
 
@@ -53,10 +53,10 @@ channel 1.
 
 ## Pairing Flow
 
-### Mini to Receiver
+### RCs1 to Receiver
 
-1. Mini normally transmits control data on channel 1.
-2. Holding `R1 + R2` for 3 seconds starts pairing. Mini sends a `pairing`
+1. RCs1 normally transmits control data on channel 1.
+2. Holding `R1 + R2` for 3 seconds starts pairing. RCs1 sends a `pairing`
    request immediately at the threshold, then repeats the same pairing session
    every 500ms while both buttons remain pressed.
 3. Releasing either button stops pairing retries. Normal control packets are
@@ -66,11 +66,11 @@ channel 1.
 
 ## Normal Operation
 
-Mini, C3, and S3 all start directly on channel 1. S3 restores permanent MAC
+RCs1, C3, and S3 all start directly on channel 1. S3 restores permanent MAC
 bindings at boot; temporary bindings are cleared when ESP-NOW is stopped or the
 device restarts. Unknown MACs cannot execute normal control requests.
 
-## Mini Input Design
+## RCs1 Input Design
 
 - Joystick axes continuously control outgoing gaze position.
 - The joystick button is a modifier: while held, `LB` sends `cp` and `RB` sends

@@ -13,6 +13,6 @@ constexpr const char *REQUEST_COMBO_PREVIOUS = "cp";
 constexpr const char *REQUEST_COMBO_NEXT = "cs";
 
 constexpr const char *DEVICE_TYPE = "remote";
-constexpr const char *DEVICE_NAME = "Draeye RC Mini";
+constexpr const char *DEVICE_NAME = "Draeyes RCs1";
 
 }  // namespace remote_protocol

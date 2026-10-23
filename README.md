@@ -1,6 +1,6 @@
-# Draeye RC Mini
+# Draeyes RCs1
 
-ESP32-C3 ESP-NOW Mini remote-control firmware for the current Draeye control
+ESP32-C3 ESP-NOW RCs1 remote-control firmware for the current Draeyes control
 network. The discontinued RC STA / STA1 and C6RC remotes are not compatibility
 targets.
 
@@ -16,10 +16,10 @@ targets.
 | Function `R1` | 6 |
 | Function `R2` | 7 |
 
-All buttons are active-low and use the internal pull-up. The ESP32-C3 Mini has
+All buttons are active-low and use the internal pull-up. The RCs1 has
 no display or status LED. In manual mode, `LB` and `RB` independently control
 the left and right eyelids by default; the legacy physical linked-blink switch
-is not present on Mini.
+is not present on the RCs1.
 
 ## ESP-NOW protocol
 
@@ -29,7 +29,7 @@ The controller sends this JSON envelope every 10 ms on fixed Wi-Fi channel 1:
 {"req":"controller","data":{"light":1.0,"j1PotX":127,"j1PotY":127,"bkl":1.0,"bkr":1.0}}
 ```
 
-The peer address is broadcast (`FF:FF:FF:FF:FF:FF`) so one Mini can control
+The peer address is broadcast (`FF:FF:FF:FF:FF:FF`) so one RCs1 can control
 multiple bound devices. Discovery, pairing, normal control, and S3 Host traffic
 all use channel 1. No channel negotiation or channel persistence is used.
 
@@ -38,7 +38,7 @@ receiver only records the sender MAC in runtime memory; no acceptance response
 or follow-up handshake is required:
 
 ```json
-{"req":"pairing","type":"remote","name":"Draeye RC Mini","channel":1,"nonce":123456}
+{"req":"pairing","type":"remote","name":"Draeyes RCs1","channel":1,"nonce":123456}
 {"req":"cp"}
 {"req":"cs"}
 ```
@@ -62,7 +62,7 @@ or follow-up handshake is required:
   continuously from normal operation and persisted in the background; there is
   no separate five-second capture period and control traffic is not paused.
 
-The light value is fixed at `1.0` because the current Mini pin allocation has
+The light value is fixed at `1.0` because the current RCs1 pin allocation has
 no light sensor.
 
 On first boot, keep the joystick centered briefly while the firmware records its
@@ -82,3 +82,10 @@ pio run
 pio run -t upload
 pio device monitor
 ```
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
+Third-party build dependencies are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+For security issues, see [SECURITY.md](SECURITY.md).

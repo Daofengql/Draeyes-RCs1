@@ -1000,7 +1000,7 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println("Draeye RC Mini starting");
+  Serial.println("Draeyes RCs1 starting");
 
   initializeInputs();
   updateBatteryMeasurement(millis(), true);
